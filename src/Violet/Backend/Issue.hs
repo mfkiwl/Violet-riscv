@@ -65,7 +65,11 @@ decode inst =
         0b0010011 -> (intActivation, layoutRdRs1) -- ALU with imm
         0b0110011 -> case slice d31 d25 inst of
             0b0000001 -> case slice d14 d14 inst of
-                0b0 -> (ctrlActivation, layoutRdRs1Rs2) -- mul
+                0b0 -> -- mul
+                    if Config.mulInAlu && slice d13 d12 inst == 0 then
+                        (intActivation, layoutRdRs1Rs2)
+                    else
+                        (ctrlActivation, layoutRdRs1Rs2)
                 0b1 -> (ctrlActivation, layoutRdRs1Rs2) -- div
             _ -> (intActivation, layoutRdRs1Rs2)
         0b0001111 -> (ctrlActivation, layoutRdRs1) -- fence
@@ -75,7 +79,7 @@ decode inst =
 dep :: (FetchT.Inst, Activation, RegLayout) -> (FetchT.Inst, Activation, RegLayout) -> Concurrency
 dep (inst1, act1, layout1) (inst2, act2, layout2) = if anyHazard then NoConcurrentIssue else CanConcurrentIssue
     where
-        memConflict = actStore act2 || (actStore act1 && actLoad act2) -- store on port 1 only; load cannot issue concurrently after store (undetectable data dependency)
+        memConflict = actStore act2 || actLoad act2 -- load/store can only issue on port 1
         ctrlConflict = actCtrl act1 || actCtrl act2
         exceptionConflict = actException act1 || actException act2
         structuralHazard = memConflict || ctrlConflict || exceptionConflict

@@ -3,3 +3,8 @@
 /verilog/
 /obj_dir/
 /VioletCore
+*.dyn_hi
+*.dyn_o
+*.elf
+/.stack-work/
+/violet-core.cabal
