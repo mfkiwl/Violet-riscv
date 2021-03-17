@@ -14,12 +14,12 @@ import qualified Debug.Trace
 import qualified Prelude
 import qualified Violet.Config as Config
 
-data LoadActivationType = NoLoad | MemLoad GprT.RegIndex | LateAlu GprT.RegIndex
+data LateActivationType = NoLate | MemLoad GprT.RegIndex | LateAlu GprT.RegIndex
     deriving (Generic, NFDataX, Eq)
 
 data IssueState = IssueState {
-    loadActivated1 :: Vec 2 LoadActivationType,
-    loadActivated2 :: Vec 2 LoadActivationType,
+    lateActivated1 :: Vec 2 LateActivationType,
+    lateActivated2 :: Vec 2 LateActivationType,
     ctrlFirstCycle :: Bool
 } deriving (Generic, NFDataX)
 
@@ -50,34 +50,36 @@ layoutRdRs1Rs2 = RegLayout { hasRd = True, hasRs1 = True, hasRs2 = True }
 layoutRs1Rs2 = RegLayout { hasRd = False, hasRs1 = True, hasRs2 = True }
 layoutNoReg = RegLayout { hasRd = False, hasRs1 = False, hasRs2 = False }
 
-decode :: FetchT.Inst -> (Activation, RegLayout)
-decode inst =
-    if inst == FetchT.nopInst then
-        (emptyActivation, layoutNoReg)
-    else case slice d6 d0 inst of
-        0b0110111 -> (intActivation, layoutRd) -- lui
-        0b0010111 -> (intActivation, layoutRd) -- auipc
-        0b1101111 -> (jalActivation, layoutRd) -- jal
-        0b1100111 -> (jalActivation, layoutRdRs1) -- jalr
-        0b1100011 -> (jActivation, layoutRs1Rs2) -- beq/bne/blt/bge/bltu/bgeu
-        0b0000011 -> (loadActivation, layoutRdRs1) -- load
-        0b0100011 -> (storeActivation, layoutRs1Rs2) -- store
-        0b0010011 -> (intActivation, layoutRdRs1) -- ALU with imm
-        0b0110011 -> case slice d31 d25 inst of
-            0b0000001 -> case slice d14 d14 inst of
-                0b0 -> -- mul
-                    if Config.mulInAlu && slice d13 d12 inst == 0 then
-                        (intActivation, layoutRdRs1Rs2)
-                    else
-                        (ctrlActivation, layoutRdRs1Rs2)
-                0b1 -> (ctrlActivation, layoutRdRs1Rs2) -- div
-            _ -> (intActivation, layoutRdRs1Rs2)
-        0b0001111 -> (ctrlActivation, layoutRdRs1) -- fence
-        0b1110011 -> (ctrlActivation, layoutNoReg) -- ecall/ebreak
-        _ -> (excActivation, layoutNoReg)
+decode :: (FetchT.Inst, FetchT.Metadata) -> (Activation, RegLayout)
 
-dep :: (FetchT.Inst, Activation, RegLayout) -> (FetchT.Inst, Activation, RegLayout) -> Concurrency
-dep (inst1, act1, layout1) (inst2, act2, layout2) = if anyHazard then NoConcurrentIssue else CanConcurrentIssue
+-- This requires `FetchT.isValidInst == True`: IC miss is still a "valid instruction", although a
+-- special one.
+decode (_, md) | FetchT.icMiss md = (ctrlActivation, layoutNoReg)
+
+decode (inst, _) = case slice d6 d0 inst of
+    0b0110111 -> (intActivation, layoutRd) -- lui
+    0b0010111 -> (intActivation, layoutRd) -- auipc
+    0b1101111 -> (jalActivation, layoutRd) -- jal
+    0b1100111 -> (jalActivation, layoutRdRs1) -- jalr
+    0b1100011 -> (jActivation, layoutRs1Rs2) -- beq/bne/blt/bge/bltu/bgeu
+    0b0000011 -> (loadActivation, layoutRdRs1) -- load
+    0b0100011 -> (storeActivation, layoutRs1Rs2) -- store
+    0b0010011 -> (intActivation, layoutRdRs1) -- ALU with imm
+    0b0110011 -> case slice d31 d25 inst of
+        0b0000001 -> case slice d14 d14 inst of
+            0b0 -> -- mul
+                if Config.mulInAlu && slice d13 d12 inst == 0 then
+                    (intActivation, layoutRdRs1Rs2)
+                else
+                    (ctrlActivation, layoutRdRs1Rs2)
+            0b1 -> (ctrlActivation, layoutRdRs1Rs2) -- div
+        _ -> (intActivation, layoutRdRs1Rs2)
+    0b0001111 -> (ctrlActivation, layoutRdRs1) -- fence
+    0b1110011 -> (ctrlActivation, layoutNoReg) -- ecall/ebreak
+    _ -> (excActivation, layoutNoReg)
+
+dep :: ((FetchT.Inst, FetchT.Metadata), Activation, RegLayout) -> ((FetchT.Inst, FetchT.Metadata), Activation, RegLayout) -> Concurrency
+dep ((inst1, _), act1, layout1) ((inst2, _), act2, layout2) = if anyHazard then NoConcurrentIssue else CanConcurrentIssue
     where
         memConflict = actStore act2 || actLoad act2 -- load/store can only issue on port 1
         ctrlConflict = actCtrl act1 || actCtrl act2
@@ -101,8 +103,8 @@ dep (inst1, act1, layout1) (inst2, act2, layout2) = if anyHazard then NoConcurre
 
         anyHazard = structuralHazard || regHazard
 
-decodeDep' :: FetchT.Inst
-           -> FetchT.Inst
+decodeDep' :: (FetchT.Inst, FetchT.Metadata)
+           -> (FetchT.Inst, FetchT.Metadata)
            -> ((Activation, RegLayout), (Activation, RegLayout), Concurrency)
 decodeDep' a b = ((act1, layout1), (act2, layout2), conc)
     where
@@ -113,12 +115,16 @@ decodeDep' a b = ((act1, layout1), (act2, layout2), conc)
 decodeDep :: FifoT.FifoItem
           -> FifoT.FifoItem
           -> ((Activation, RegLayout), (Activation, RegLayout), Concurrency)
-decodeDep a b = decodeDep' inst1 inst2
+decodeDep a b = case (inst1, inst2) of
+    (Just ll, Just rr) -> decodeDep' ll rr
+    (Just ll, Nothing) -> (decode ll, (emptyActivation, layoutNoReg), CanConcurrentIssue)
+    (Nothing, Just rr) -> ((emptyActivation, layoutNoReg), decode rr, CanConcurrentIssue)
+    (Nothing, Nothing) -> ((emptyActivation, layoutNoReg), (emptyActivation, layoutNoReg), CanConcurrentIssue)
     where
         inst1 = selInst a
         inst2 = selInst b
-        selInst (FifoT.Item (_, x, md)) = if FetchT.isValidInst md then x else FetchT.nopInst
-        selInst FifoT.Bubble = FetchT.nopInst
+        selInst (FifoT.Item (_, x, md)) = if FetchT.isValidInst md then Just (x, md) else Nothing
+        selInst FifoT.Bubble = Nothing
 
 issue' :: (IssueState, IssuePort, IssuePort, ActivationMask, (PipeT.Recovery, FifoT.FifoPopReq))
        -> IssueInput
@@ -144,22 +150,22 @@ issue' (state, port1, port2, am, (recovery, popReq)) (item1, item2, ctrlBusy) =
         aluDeferred1 = Config.lateALU && not disableFirstPort && useConflict1 && (actInt act1 || actBranch act1)
         aluDeferred2 = Config.lateALU && enableSecondPort && useConflict2 && (actInt act2 || actBranch act2)
 
-        -- Load blocked if a load-use hazard is detected or we are resolving an exception.
+        -- Data blocked if a load/latealu-use hazard is detected or we are resolving an exception.
         -- We need to block on exception resolution because the DCache pipeline is separate from
         -- the main commit pipelines and will not get reset on recovery signals.
-        loadBlocked =
+        dataBlocked =
             (not disableFirstPort && useConflict1 && not aluDeferred1) ||
             (enableSecondPort && useConflict2 && not aluDeferred2) ||
             (isExceptionResolved && hasOngoingLoadOrLateAlu state)
         ctrlBlocked = ctrlFirstCycle state || ctrlBusy == CtrlT.Busy
 
-        pipelineBlocked = loadBlocked || ctrlBlocked
+        pipelineBlocked = dataBlocked || ctrlBlocked
 
         -- Don't re-activate if we didn't issue
-        loadDst1 = if not pipelineBlocked && not disableFirstPort then itemLoadOrLateAluDstReg item1 act1 layout1 aluDeferred1 else NoLoad
-        loadDst2 = if not pipelineBlocked && enableSecondPort then itemLoadOrLateAluDstReg item2 act2 layout2 aluDeferred2 else NoLoad
-        loadActivated1' = fst $ shiftInAtN (loadActivated1 state) (loadDst1 :> Nil)
-        loadActivated2' = fst $ shiftInAtN (loadActivated2 state) (loadDst2 :> Nil)
+        lateDst1 = if not pipelineBlocked && not disableFirstPort then resolveLateActivationType item1 act1 layout1 aluDeferred1 else NoLate
+        lateDst2 = if not pipelineBlocked && enableSecondPort then resolveLateActivationType item2 act2 layout2 aluDeferred2 else NoLate
+        lateActivated1' = fst $ shiftInAtN (lateActivated1 state) (lateDst1 :> Nil)
+        lateActivated2' = fst $ shiftInAtN (lateActivated2 state) (lateDst2 :> Nil)
         ctrlFirstCycle' = actCtrl act1 && not pipelineBlocked
 
         amNormal = ActivationMask {
@@ -172,7 +178,6 @@ issue' (state, port1, port2, am, (recovery, popReq)) (item1, item2, ctrlBusy) =
             amLateBranch1 = actBranch act1 && not disableFirstPort && aluDeferred1,
             amLateBranch2 = actBranch act2 && enableSecondPort && aluDeferred2,
             amMem1 = (actLoad act1 || actStore act1) && not disableFirstPort,
-            amMem2 = actLoad act2 && enableSecondPort,
             amCtrl =
                 if actException act1 && not disableFirstPort then Just CtrlDecodeException
                 else if actCtrl act1 && not disableFirstPort then Just CtrlNormal
@@ -185,24 +190,24 @@ issue' (state, port1, port2, am, (recovery, popReq)) (item1, item2, ctrlBusy) =
         recovery' = if isExceptionResolved then PipeT.IsRecovery else PipeT.NotRecovery
         port1' = genIssuePort item1
         port2' = genIssuePort item2
-        state' = IssueState { loadActivated1 = loadActivated1', loadActivated2 = loadActivated2', ctrlFirstCycle = ctrlFirstCycle' }
+        state' = IssueState { lateActivated1 = lateActivated1', lateActivated2 = lateActivated2', ctrlFirstCycle = ctrlFirstCycle' }
 
 issue :: HiddenClockResetEnable dom
       => Signal dom IssueInput
       -> Signal dom IssueOutput
-issue = mealy issue' (IssueState { loadActivated1 = repeat NoLoad, loadActivated2 = repeat NoLoad, ctrlFirstCycle = False }, emptyIssuePort, emptyIssuePort, emptyActivationMask, (PipeT.NotRecovery, FifoT.PopNothing))
+issue = mealy issue' (IssueState { lateActivated1 = repeat NoLate, lateActivated2 = repeat NoLate, ctrlFirstCycle = False }, emptyIssuePort, emptyIssuePort, emptyActivationMask, (PipeT.NotRecovery, FifoT.PopNothing))
 
 hasOngoingLoadOrLateAlu :: IssueState -> Bool
-hasOngoingLoadOrLateAlu state = f (loadActivated1 state) || f (loadActivated2 state)
+hasOngoingLoadOrLateAlu state = f (lateActivated1 state) || f (lateActivated2 state)
     where
-        f actList = case findIndex (\x -> x /= NoLoad) actList of
+        f actList = case findIndex (\x -> x /= NoLate) actList of
             Just _ -> True
             Nothing -> False
 
 hasUseConflict :: IssueState -> FifoT.FifoItem -> RegLayout -> Bool
 hasUseConflict state item layout = case item of
     FifoT.Item (_, i, _) ->
-        f (loadActivated1 state) || f (loadActivated2 state)
+        f (lateActivated1 state) || f (lateActivated2 state)
             where
                 (rs1, rs2) = GprT.decodeRs i
                 f actList = case findIndex (\x -> (hasRs1 layout && (x == MemLoad rs1 || x == LateAlu rs1)) || (hasRs2 layout && (x == MemLoad rs2 || x == LateAlu rs2))) actList of
@@ -210,19 +215,19 @@ hasUseConflict state item layout = case item of
                     Nothing -> False
     _ -> False
 
-itemLoadOrLateAluDstReg :: FifoT.FifoItem -> Activation -> RegLayout -> Bool -> LoadActivationType
-itemLoadOrLateAluDstReg item act layout aluDeferred = case item of
+resolveLateActivationType :: FifoT.FifoItem -> Activation -> RegLayout -> Bool -> LateActivationType
+resolveLateActivationType item act layout aluDeferred = case item of
     FifoT.Item (_, i, _) ->
         if actLoad act then
             case GprT.decodeRd i of
-                0 -> NoLoad
+                0 -> NoLate
                 x -> MemLoad x
         else if hasRd layout && (actInt act || actBranch act) && aluDeferred then
             case GprT.decodeRd i of
-                0 -> NoLoad
+                0 -> NoLate
                 x -> LateAlu x
-        else NoLoad
-    _ -> NoLoad
+        else NoLate
+    _ -> NoLate
 
 itemWantsExceptionResolution :: FifoT.FifoItem -> Bool
 itemWantsExceptionResolution item = case item of
@@ -235,7 +240,7 @@ genIssuePort item = case item of
     _ -> emptyIssuePort
 
 emptyIssuePort :: IssuePort
-emptyIssuePort = (0, FetchT.nopInst, FetchT.emptyMetadata)
+emptyIssuePort = (0, undefined, FetchT.emptyMetadata)
 
 emptyActivationMask :: ActivationMask
 emptyActivationMask = ActivationMask {
@@ -248,7 +253,6 @@ emptyActivationMask = ActivationMask {
     amLateBranch1 = False,
     amLateBranch2 = False,
     amMem1 = False,
-    amMem2 = False,
     amCtrl = Nothing
 }
 

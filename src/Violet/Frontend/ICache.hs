@@ -6,23 +6,22 @@ import qualified Violet.Types.Fetch as FetchT
 import qualified Violet.Types.Fifo as FifoT
 
 emptyResultPair :: ((FetchT.PC, FetchT.Inst, FetchT.Metadata), (FetchT.PC, FetchT.Inst, FetchT.Metadata))
-emptyResultPair = ((0, FetchT.nopInst, FetchT.emptyMetadata), (0, FetchT.nopInst, FetchT.emptyMetadata))
+emptyResultPair = ((0, undefined, FetchT.emptyMetadata), (0, undefined, FetchT.emptyMetadata))
 
 icache :: HiddenClockResetEnable dom
-       => ICacheImpl a
-       => a
+       => ICacheIssueAccess dom
        -> Signal dom (FetchT.PC, FetchT.Metadata)
        -> Signal dom FetchT.PC
        -> Signal dom (Maybe Bool, Maybe Bool)
        -> Signal dom FifoT.FifoPushCap
        -> Signal dom (FetchT.PreDecodeCmd, FetchT.PreDecodeAck, (FifoT.FifoItem, FifoT.FifoItem), FetchT.GlobalHistory)
-icache impl fetchReq btbPrediction bhtPrediction pushCap = bundle (pdCmdReg, pdAckReg, regIssuePorts, fmap FetchT.GlobalHistory globalHistory)
+icache icIssuer fetchReq btbPrediction bhtPrediction pushCap = bundle (pdCmdReg, pdAckReg, regIssuePorts, fmap FetchT.GlobalHistory globalHistory)
     where
         (fetchPC, _) = unbundle fetchReq
         alignedPC = fmap (\x -> slice d31 d3 x ++# 0) fetchPC
         delayedFetchReq = FifoT.gatedRegister (0, FetchT.emptyMetadata) pushCap fetchReq
         (_, delayedFetchMd) = unbundle delayedFetchReq
-        rawAccessRes = issueAccess impl alignedPC pushCap
+        rawAccessRes = icIssuer alignedPC pushCap
         accessRes = fmap decodeAccessResult $ bundle (rawAccessRes, delayedFetchReq)
 
         -- Global prediction.
@@ -66,7 +65,7 @@ icache impl fetchReq btbPrediction bhtPrediction pushCap = bundle (pdCmdReg, pdA
 
 decodeAccessResult :: (Maybe (BitVector 64), (FetchT.PC, FetchT.Metadata))
                    -> ((FetchT.PC, FetchT.Inst, FetchT.Metadata), (FetchT.PC, FetchT.Inst, FetchT.Metadata))
-decodeAccessResult (Nothing, _) = emptyResultPair
+decodeAccessResult (Nothing, _) = ((0, undefined, FetchT.validMetadata { FetchT.icMiss = True }), (0, undefined, FetchT.emptyMetadata))
 decodeAccessResult (Just rawRes, (pc, fetchMeta)) = ((pc1, inst1, md1), (pc2, inst2, md2))
     where
         hasOffset = testBit pc 2

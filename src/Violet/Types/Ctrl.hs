@@ -7,12 +7,26 @@ data CtrlBusy = Busy | Idle
 
 data SystemBusOut = SystemBusOut {
     oFastBus :: FastBusOut,
-    oIoBus :: IOBusOut
+    oIoBus :: IOBusOut,
+    oIcRefill :: IcRefillOut
 } deriving (Generic, NFDataX)
 
 data SystemBusIn = SystemBusIn {
     iFastBus :: FastBusIn,
-    iIoBus :: IOBusIn
+    iIoBus :: IOBusIn,
+    iIcRefill :: IcRefillIn,
+    iIcRefillReady :: Bool
+} deriving (Generic, NFDataX)
+
+data IcRefillIn = IcRefillIn {
+    iIcRefillValid :: BitVector 32,
+    iIcRefillAddr :: BitVector 32,
+    iIcRefillData :: BitVector 32
+} deriving (Generic, NFDataX)
+
+data IcRefillOut = IcRefillOut {
+    oIcRefillValid :: Bool,
+    oIcRefillAddr :: BitVector 32
 } deriving (Generic, NFDataX)
 
 data FastBusOut = FastBusOut {
@@ -47,7 +61,8 @@ data IOBusIn = IOBusIn {
 
 idleSystemBusOut = SystemBusOut {
     oFastBus = idleFastBusOut,
-    oIoBus = idleIOBusOut
+    oIoBus = idleIOBusOut,
+    oIcRefill = idleIcRefillOut
 }
 
 idleIOBusOut = IOBusOut {
@@ -65,4 +80,9 @@ idleFastBusOut = FastBusOut {
     oFastWrAddr = undefined,
     oFastWrData = undefined,
     oFastWrMask = undefined
+}
+
+idleIcRefillOut = IcRefillOut {
+    oIcRefillValid = False,
+    oIcRefillAddr = undefined
 }
